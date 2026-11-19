@@ -1,0 +1,282 @@
+
+function processCalendarEvents() {
+  const lock = LockService.getScriptLock();
+
+  // Prevent simultaneous executions
+  if (!lock.tryLock(30000)) {
+    console.log("Another execution is running. Skipping.");
+    return;
+  }
+
+  try {
+    const calendar = CalendarApp.getDefaultCalendar();
+    const now = new Date();
+
+    const prepTitle = "Meeting Prep - Ask Before Scheduling";
+    const notesTitle = "Notes - Ask Before Scheduling";
+
+    // Search window: now through the next 30 days
+    const startSearch = new Date(now);
+    const endSearch = new Date(
+      now.getTime() + 30 * 24 * 60 * 60 * 1000
+    );
+
+    // Retrieve upcoming calendar events once
+    const allEvents = calendar.getEvents(startSearch, endSearch);
+
+    // Process meetings chronologically
+    allEvents.sort((a, b) =>
+      a.getStartTime().getTime() - b.getStartTime().getTime()
+    );
+
+    // Track events created during this execution
+    const createdEvents = [];
+
+    let prepCreated = 0;
+    let notesCreated = 0;
+    let skipped = 0;
+
+    console.log("Starting calendar scan. Found " + allEvents.length + " events.");
+
+    // Helper: Check for external attendees
+    function hasExternalGuest(event) {
+      return event.getGuestList().some(guest => {
+        const email = (guest.getEmail() || "").toLowerCase();
+
+        return email && !email.endsWith("@copado.com");
+      });
+    }
+
+    // Helper: Find conflicting timed events
+    function getConflicts(meeting, windowStart, windowEnd) {
+      // Query the proposed window directly
+      const existingEvents = calendar.getEvents(
+        windowStart,
+        windowEnd
+      );
+
+      // Include events created during this execution
+      const combinedEvents = existingEvents.concat(createdEvents);
+
+      // Remove duplicate references and identify actual conflicts
+      const seenIds = new Set();
+
+      return combinedEvents.filter(existing => {
+        const id = existing.getId();
+
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+
+        // Ignore the qualifying meeting itself
+        if (id === meeting.getId()) return false;
+
+        // Ignore all-day events
+        if (existing.isAllDayEvent()) return false;
+
+        const existingStart = existing.getStartTime().getTime();
+        const existingEnd = existing.getEndTime().getTime();
+
+        return (
+          existingStart < windowEnd.getTime() &&
+          existingEnd > windowStart.getTime()
+        );
+      });
+    }
+
+    // Helper: Create a calendar block
+    function createBlock(title, start, end, meeting) {
+      const newEvent = calendar.createEvent(title, start, end);
+
+      createdEvents.push(newEvent);
+
+      if (title === prepTitle) {
+        prepCreated++;
+      } else {
+        notesCreated++;
+      }
+
+      console.log(
+        "SUCCESS - Created " + title +
+        " for: " + meeting.getTitle() +
+        " | " + start.toISOString() +
+        " to " + end.toISOString()
+      );
+    }
+
+    // Process each calendar event
+    allEvents.forEach(event => {
+      const meetingTitle = event.getTitle();
+      const meetingStart = event.getStartTime();
+      const meetingEnd = event.getEndTime();
+
+      // Skip existing Prep and Notes events
+      if (
+        meetingTitle === prepTitle ||
+        meetingTitle === notesTitle
+      ) return;
+
+      // Skip meetings that have already started
+      if (meetingStart < now) return;
+
+      // Calculate meeting duration
+      const duration =
+        (meetingEnd.getTime() - meetingStart.getTime()) / 60000;
+
+      // Must have at least one external attendee
+      if (!hasExternalGuest(event)) return;
+
+      // ==================================================
+      // SCENARIO 1: MEETING PREP - 45 MINUTES OR LONGER
+      // ==================================================
+
+      if (duration >= 45) {
+        const prepEndTime = meetingStart;
+
+        const prepStartTime = new Date(
+          prepEndTime.getTime() - 15 * 60 * 1000
+        );
+
+        // Don't create prep blocks that have already started
+        if (prepStartTime >= now) {
+          const conflicts = getConflicts(
+            event,
+            prepStartTime,
+            prepEndTime
+          );
+
+          if (conflicts.length === 0) {
+            createBlock(
+              prepTitle,
+              prepStartTime,
+              prepEndTime,
+              event
+            );
+          } else {
+            console.log(
+              "SKIPPED - Prep window unavailable: " + meetingTitle
+            );
+            skipped++;
+          }
+        } else {
+          console.log(
+            "SKIPPED - Prep window already started: " + meetingTitle
+          );
+          skipped++;
+        }
+      }
+
+      // ==================================================
+      // SCENARIO 2: NOTES - EXACTLY 30-MINUTE MEETINGS
+      // ==================================================
+
+      if (duration === 30) {
+        const noteStartTime = meetingEnd;
+
+        const noteEndTime = new Date(
+          noteStartTime.getTime() + 15 * 60 * 1000
+        );
+
+        const conflicts = getConflicts(
+          event,
+          noteStartTime,
+          noteEndTime
+        );
+
+        if (conflicts.length === 0) {
+          createBlock(
+            notesTitle,
+            noteStartTime,
+            noteEndTime,
+            event
+          );
+        } else {
+          console.log(
+            "SKIPPED - 15-minute Notes window unavailable: " +
+            meetingTitle
+          );
+          skipped++;
+        }
+      }
+
+      // ==================================================
+      // SCENARIO 3: NOTES - 45-MINUTE OR LONGER MEETINGS
+      // ==================================================
+
+      if (duration >= 45) {
+        const noteStartTime = meetingEnd;
+
+        // First attempt: 30 minutes
+        const thirtyMinuteEnd = new Date(
+          noteStartTime.getTime() + 30 * 60 * 1000
+        );
+
+        // Second attempt: 15 minutes
+        const fifteenMinuteEnd = new Date(
+          noteStartTime.getTime() + 15 * 60 * 1000
+        );
+
+        // Check the entire 30-minute window
+        const conflicts = getConflicts(
+          event,
+          noteStartTime,
+          thirtyMinuteEnd
+        );
+
+        // OPTION 1: Entire 30-minute window is free
+        if (conflicts.length === 0) {
+          createBlock(
+            notesTitle,
+            noteStartTime,
+            thirtyMinuteEnd,
+            event
+          );
+
+          return;
+        }
+
+        // OPTION 2: Check whether first 15 minutes are free
+        const fifteenMinuteConflicts = conflicts.filter(conflict => {
+          const existingStart = conflict.getStartTime().getTime();
+          const existingEnd = conflict.getEndTime().getTime();
+
+          return (
+            existingStart < fifteenMinuteEnd.getTime() &&
+            existingEnd > noteStartTime.getTime()
+          );
+        });
+
+        if (fifteenMinuteConflicts.length === 0) {
+          createBlock(
+            notesTitle,
+            noteStartTime,
+            fifteenMinuteEnd,
+            event
+          );
+
+          return;
+        }
+
+        // OPTION 3: Neither window is available
+        console.log(
+          "SKIPPED - Neither 30 nor 15 minutes available: " +
+          meetingTitle
+        );
+
+        skipped++;
+      }
+    });
+
+    // Final summary
+    console.log("================================");
+    console.log("CALENDAR SCAN COMPLETE");
+    console.log("Meeting Prep blocks created: " + prepCreated);
+    console.log("Notes blocks created: " + notesCreated);
+    console.log("Meetings skipped: " + skipped);
+    console.log("Total blocks created: " +
+      (prepCreated + notesCreated));
+    console.log("================================");
+
+  } finally {
+    lock.releaseLock();
+  }
+}
