@@ -1,0 +1,531 @@
+
+function processCalendarEvents() {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    console.log("Another execution is running. Skipping.");
+    return;
+  }
+
+  try {
+    const calendar = CalendarApp.getDefaultCalendar();
+    const properties = PropertiesService.getScriptProperties();
+
+    const prepTitle = "Meeting Prep - Ask Before Scheduling";
+    const notesTitle = "Notes - Ask Before Scheduling";
+    const trackingPrefix = "CAL_AUTO_TRACK_";
+
+    const now = new Date();
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+
+    const startSearch = new Date(now);
+    const endSearch = new Date(now.getTime() + thirtyDays);
+    const reconciliationStart = new Date(now.getTime() - thirtyDays);
+
+    // ==================================================
+    // HELPER FUNCTIONS
+    // ==================================================
+
+    // Generate a unique tracking key for each meeting occurrence.
+    // Including the start time distinguishes recurring instances.
+    function getSourceKey(event) {
+      return event.getId() + "|" + event.getStartTime().getTime();
+    }
+
+    function getPropertyKey(sourceKey) {
+      return trackingPrefix +
+        Utilities.base64EncodeWebSafe(sourceKey);
+    }
+
+    // Check for external attendees
+    function hasExternalGuest(event) {
+      return event.getGuestList().some(guest => {
+        const email = (guest.getEmail() || "").toLowerCase();
+
+        return email && !email.endsWith("@copado.com");
+      });
+    }
+
+    // Check whether a meeting still qualifies for automation
+    function qualifies(event) {
+      const title = event.getTitle();
+
+      if (title === prepTitle || title === notesTitle) {
+        return false;
+      }
+
+      const duration =
+        (event.getEndTime().getTime() -
+         event.getStartTime().getTime()) / 60000;
+
+      return (
+        (duration === 30 || duration >= 45) &&
+        hasExternalGuest(event)
+      );
+    }
+
+    // Retrieve a tracked event only if it still has its expected title
+    function getTrackedEvent(eventId, expectedTitle) {
+      if (!eventId) return null;
+
+      const event = CalendarApp.getEventById(eventId);
+
+      if (!event) return null;
+      if (event.getTitle() !== expectedTitle) return null;
+
+      return event;
+    }
+
+    // Delete only events owned and tracked by this automation
+    function deleteTrackedEvent(eventId, expectedTitle) {
+      if (!eventId) return;
+
+      const event = CalendarApp.getEventById(eventId);
+
+      if (event && event.getTitle() === expectedTitle) {
+        console.log(
+          "Deleting automated event: " +
+          expectedTitle + " | " + event.getStartTime()
+        );
+
+        event.deleteEvent();
+      }
+    }
+
+    function deleteTrackedBlocks(record) {
+      deleteTrackedEvent(record.prepId, prepTitle);
+      deleteTrackedEvent(record.notesId, notesTitle);
+    }
+
+    // Identify conflicts with timed calendar events
+    function getConflicts(meeting, windowStart, windowEnd) {
+      const existingEvents = calendar.getEvents(
+        windowStart,
+        windowEnd
+      );
+
+      // Include events created during this execution
+      const combinedEvents = existingEvents.concat(createdEvents);
+      const seenIds = new Set();
+
+      return combinedEvents.filter(existing => {
+        const id = existing.getId();
+
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+
+        // Ignore the qualifying meeting itself
+        if (id === meeting.getId()) return false;
+
+        // Ignore all-day events
+        if (existing.isAllDayEvent()) return false;
+
+        const existingStart = existing.getStartTime().getTime();
+        const existingEnd = existing.getEndTime().getTime();
+
+        return (
+          existingStart < windowEnd.getTime() &&
+          existingEnd > windowStart.getTime()
+        );
+      });
+    }
+
+    // Create and track a new calendar event
+    function createTrackedBlock(title, start, end, sourceRecord) {
+      const newEvent = calendar.createEvent(title, start, end);
+
+      createdEvents.push(newEvent);
+
+      if (title === prepTitle) {
+        sourceRecord.prepId = newEvent.getId();
+      } else {
+        sourceRecord.notesId = newEvent.getId();
+      }
+
+      console.log(
+        "CREATED: " + title +
+        " | " + start.toISOString() +
+        " to " + end.toISOString()
+      );
+    }
+
+    // ==================================================
+    // STEP 1: LOAD EXISTING TRACKING INFORMATION
+    // ==================================================
+
+    const allProperties = properties.getProperties();
+    const trackedRecords = {};
+
+    Object.keys(allProperties).forEach(propertyKey => {
+      if (!propertyKey.startsWith(trackingPrefix)) return;
+
+      try {
+        const record = JSON.parse(allProperties[propertyKey]);
+
+        trackedRecords[record.sourceKey] = {
+          ...record,
+          propertyKey: propertyKey
+        };
+
+      } catch (error) {
+        console.log("Invalid tracking record: " + propertyKey);
+      }
+    });
+
+    // ==================================================
+    // STEP 2: FIND EXISTING MEETINGS
+    // ==================================================
+
+    // Search a 30-day lookback to distinguish completed
+    // meetings from deleted or moved meetings.
+    const reconciliationEvents = calendar.getEvents(
+      reconciliationStart,
+      endSearch
+    );
+
+    const reconciliationMap = new Map();
+
+    reconciliationEvents.forEach(event => {
+      reconciliationMap.set(getSourceKey(event), event);
+    });
+
+    // Also retrieve the upcoming meetings for scheduling
+    const upcomingEvents = calendar.getEvents(
+      startSearch,
+      endSearch
+    );
+
+    upcomingEvents.sort((a, b) =>
+      a.getStartTime().getTime() -
+      b.getStartTime().getTime()
+    );
+
+    // ==================================================
+    // STEP 3: RECONCILE PREVIOUSLY CREATED EVENTS
+    // ==================================================
+
+    let deletedBlocks = 0;
+    const activeRecords = {};
+
+    Object.keys(trackedRecords).forEach(sourceKey => {
+      const record = trackedRecords[sourceKey];
+
+      const sourceMeeting = reconciliationMap.get(sourceKey);
+
+      // Original meeting no longer exists at its tracked time.
+      // It may have been deleted or moved.
+      if (!sourceMeeting) {
+        console.log(
+          "ORIGINAL MEETING MISSING OR MOVED: " +
+          sourceKey
+        );
+
+        deleteTrackedBlocks(record);
+        properties.deleteProperty(record.propertyKey);
+        deletedBlocks++;
+        return;
+      }
+
+      const currentStart = sourceMeeting.getStartTime().getTime();
+      const currentEnd = sourceMeeting.getEndTime().getTime();
+
+      // Meeting duration or start/end time has changed.
+      if (
+        currentStart !== record.sourceStart ||
+        currentEnd !== record.sourceEnd
+      ) {
+        console.log(
+          "ORIGINAL MEETING CHANGED: " +
+          sourceMeeting.getTitle()
+        );
+
+        deleteTrackedBlocks(record);
+        properties.deleteProperty(record.propertyKey);
+        deletedBlocks++;
+        return;
+      }
+
+      // Meeting no longer qualifies for automation.
+      if (!qualifies(sourceMeeting)) {
+        console.log(
+          "MEETING NO LONGER QUALIFIES: " +
+          sourceMeeting.getTitle()
+        );
+
+        deleteTrackedBlocks(record);
+        properties.deleteProperty(record.propertyKey);
+        deletedBlocks++;
+        return;
+      }
+
+      // Completed meetings retain their historical blocks.
+      // Remove tracking once the meeting has ended.
+      if (currentEnd <= now.getTime()) {
+        properties.deleteProperty(record.propertyKey);
+
+        console.log(
+          "COMPLETED MEETING - Preserving historical blocks: " +
+          sourceMeeting.getTitle()
+        );
+
+        return;
+      }
+
+      // Keep tracking active for upcoming or ongoing meetings.
+      activeRecords[sourceKey] = record;
+
+    });
+
+    // ==================================================
+    // STEP 4: PROCESS UPCOMING MEETINGS
+    // ==================================================
+
+    let prepCreated = 0;
+    let notesCreated = 0;
+    let skipped = 0;
+
+    // Track new events created during this execution
+    const createdEvents = [];
+
+    console.log(
+      "Starting scheduling scan. Found " +
+      upcomingEvents.length + " upcoming events."
+    );
+
+    upcomingEvents.forEach(event => {
+      const meetingTitle = event.getTitle();
+      const meetingStart = event.getStartTime();
+      const meetingEnd = event.getEndTime();
+
+      // Skip automated events
+      if (
+        meetingTitle === prepTitle ||
+        meetingTitle === notesTitle
+      ) return;
+
+      // Skip meetings that have already started
+      if (meetingStart < now) return;
+
+      const duration =
+        (meetingEnd.getTime() - meetingStart.getTime()) / 60000;
+
+      // Only exactly 30-minute meetings or meetings of 45+ minutes
+      if (duration !== 30 && duration < 45) return;
+
+      // Require an external attendee
+      if (!hasExternalGuest(event)) return;
+
+      const sourceKey = getSourceKey(event);
+
+      let record = activeRecords[sourceKey];
+
+      // Create a tracking record if this is a new meeting
+      if (!record) {
+        record = {
+          sourceKey: sourceKey,
+          sourceStart: meetingStart.getTime(),
+          sourceEnd: meetingEnd.getTime(),
+          prepId: null,
+          notesId: null,
+          propertyKey: getPropertyKey(sourceKey)
+        };
+      }
+
+      // Verify tracked blocks still exist
+      const existingPrep = getTrackedEvent(
+        record.prepId,
+        prepTitle
+      );
+
+      const existingNotes = getTrackedEvent(
+        record.notesId,
+        notesTitle
+      );
+
+      if (!existingPrep) record.prepId = null;
+      if (!existingNotes) record.notesId = null;
+
+      // ================================================
+      // SCENARIO 1: MEETING PREP - 45 MINUTES OR LONGER
+      // ================================================
+
+      if (duration >= 45 && !record.prepId) {
+        const prepEndTime = meetingStart;
+
+        const prepStartTime = new Date(
+          prepEndTime.getTime() - 15 * 60 * 1000
+        );
+
+        if (prepStartTime >= now) {
+          const conflicts = getConflicts(
+            event,
+            prepStartTime,
+            prepEndTime
+          );
+
+          if (conflicts.length === 0) {
+            createTrackedBlock(
+              prepTitle,
+              prepStartTime,
+              prepEndTime,
+              record
+            );
+
+            prepCreated++;
+
+          } else {
+            console.log(
+              "SKIPPED - Prep conflict: " + meetingTitle
+            );
+
+            skipped++;
+          }
+
+        } else {
+          console.log(
+            "SKIPPED - Prep window already started: " +
+            meetingTitle
+          );
+
+          skipped++;
+        }
+      }
+
+      // ================================================
+      // SCENARIO 2: NOTES - EXACTLY 30-MINUTE MEETINGS
+      // ================================================
+
+      if (duration === 30 && !record.notesId) {
+        const noteStartTime = meetingEnd;
+
+        const noteEndTime = new Date(
+          noteStartTime.getTime() + 15 * 60 * 1000
+        );
+
+        const conflicts = getConflicts(
+          event,
+          noteStartTime,
+          noteEndTime
+        );
+
+        if (conflicts.length === 0) {
+          createTrackedBlock(
+            notesTitle,
+            noteStartTime,
+            noteEndTime,
+            record
+          );
+
+          notesCreated++;
+
+        } else {
+          console.log(
+            "SKIPPED - 15-minute Notes conflict: " +
+            meetingTitle
+          );
+
+          skipped++;
+        }
+      }
+
+      // ================================================
+      // SCENARIO 3: NOTES - 45 MINUTES OR LONGER
+      // ================================================
+
+      if (duration >= 45 && !record.notesId) {
+        const noteStartTime = meetingEnd;
+
+        const thirtyMinuteEnd = new Date(
+          noteStartTime.getTime() + 30 * 60 * 1000
+        );
+
+        const fifteenMinuteEnd = new Date(
+          noteStartTime.getTime() + 15 * 60 * 1000
+        );
+
+        // First attempt: 30 minutes
+        const conflicts = getConflicts(
+          event,
+          noteStartTime,
+          thirtyMinuteEnd
+        );
+
+        if (conflicts.length === 0) {
+          createTrackedBlock(
+            notesTitle,
+            noteStartTime,
+            thirtyMinuteEnd,
+            record
+          );
+
+          notesCreated++;
+
+        } else {
+          // Second attempt: 15 minutes
+          const fifteenMinuteConflicts = conflicts.filter(conflict => {
+            const existingStart = conflict.getStartTime().getTime();
+            const existingEnd = conflict.getEndTime().getTime();
+
+            return (
+              existingStart < fifteenMinuteEnd.getTime() &&
+              existingEnd > noteStartTime.getTime()
+            );
+          });
+
+          if (fifteenMinuteConflicts.length === 0) {
+            createTrackedBlock(
+              notesTitle,
+              noteStartTime,
+              fifteenMinuteEnd,
+              record
+            );
+
+            notesCreated++;
+
+          } else {
+            console.log(
+              "SKIPPED - Neither Notes window available: " +
+              meetingTitle
+            );
+
+            skipped++;
+          }
+        }
+      }
+
+      // Save tracking information if at least one block exists
+      if (record.prepId || record.notesId) {
+        properties.setProperty(
+          record.propertyKey,
+          JSON.stringify({
+            sourceKey: record.sourceKey,
+            sourceStart: record.sourceStart,
+            sourceEnd: record.sourceEnd,
+            prepId: record.prepId,
+            notesId: record.notesId
+          })
+        );
+      } else {
+        properties.deleteProperty(record.propertyKey);
+      }
+
+    });
+
+    // ==================================================
+    // STEP 5: FINAL SUMMARY
+    // ==================================================
+
+    console.log("================================");
+    console.log("CALENDAR AUTOMATION COMPLETE");
+    console.log("Meeting Prep created: " + prepCreated);
+    console.log("Notes created: " + notesCreated);
+    console.log("Previously created blocks deleted: " + deletedBlocks);
+    console.log("Meetings skipped: " + skipped);
+    console.log("Total new blocks: " +
+      (prepCreated + notesCreated));
+    console.log("================================");
+
+  } finally {
+    lock.releaseLock();
+  }
+}
